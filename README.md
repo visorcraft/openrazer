@@ -40,6 +40,183 @@ The following applications complement and interact with this driver:
 * [Snake](http://bithatch.co.uk/snake.html) - a stylised tool and tray applet for configuring Razer devices on Linux, written in Java.
 * [Chroma Feedback](https://github.com/redaxmedia/chroma-feedback) - Turn your Razer keyboard, mouse or headphone into a extreme feedback device
 
+## CachyOS local package build notes
+
+These notes document the Visorcraft CachyOS setup used for the Razer Blade 16 (2026), USB ID `1532:02E0`.
+The goal is to build installable pacman packages from this repository instead of running the raw `make install` targets.
+
+The working branch used locally was `visorcraft-blade-16-2026-v3.12.2`, which is upstream `v3.12.2` plus the Visorcraft `origin/add-blade-16-2026` support commit:
+
+```bash
+cd /path/to/openrazer
+git fetch origin
+git fetch https://github.com/openrazer/openrazer.git tag v3.12.2
+git switch -c visorcraft-blade-16-2026-v3.12.2 v3.12.2
+git cherry-pick origin/add-blade-16-2026
+```
+
+Install the build and runtime dependencies. Make sure the header package for the running kernel is installed; this system was running `linux-cachyos-rc`, so both normal and RC CachyOS headers were present:
+
+```bash
+sudo pacman -S --needed \
+  base-devel git dkms linux-cachyos-headers linux-cachyos-rc-headers \
+  python-setuptools python-dbus python-daemonize python-gobject \
+  python-pyudev python-setproctitle python-numpy xautomation libnotify
+```
+
+Create local split packages from the checked-out repository. This mirrors the Arch package shape (`openrazer-driver-dkms`, `openrazer-daemon`, and `python-openrazer`) while applying CachyOS/Arch group handling for `openrazer` instead of upstream `plugdev`.
+
+```bash
+rm -rf /tmp/openrazer-cachyos-pkg
+mkdir -p /tmp/openrazer-cachyos-pkg
+git archive --format=tar --prefix=openrazer/ HEAD > /tmp/openrazer-cachyos-pkg/openrazer-local.tar
+printf 'g openrazer -\n' > /tmp/openrazer-cachyos-pkg/sysusers.conf
+cd /tmp/openrazer-cachyos-pkg
+```
+
+Use this `PKGBUILD`:
+
+```bash
+cat > PKGBUILD <<'PKGBUILD'
+pkgbase=openrazer
+pkgname=(openrazer-daemon openrazer-driver-dkms python-openrazer)
+pkgver=3.12.2
+pkgrel=4
+pkgdesc="Community-led effort to support Razer peripherals on Linux"
+arch=(any)
+url="https://openrazer.github.io"
+license=(GPL)
+makedepends=(python-setuptools)
+source=("openrazer-local.tar" "sysusers.conf")
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+  cd "$pkgbase"
+  sed -i \
+    -e 's/plugdev group/openrazer group/g' \
+    -e 's/_check_plugdev_group/_check_openrazer_group/g' \
+    -e 's/the plugdev group/the openrazer group/g' \
+    -e 's/\$USER plugdev/\$USER openrazer/g' \
+    -e "s/getgrnam('plugdev')/getgrnam('openrazer')/g" \
+    -e "s/file_group_name != 'plugdev'/file_group_name != 'openrazer'/g" \
+    -e 's/owned by plugdev/owned by openrazer/g' \
+    daemon/openrazer_daemon/daemon.py
+  sed -i 's/GROUP:="plugdev"/GROUP:="openrazer"/' install_files/udev/99-razer.rules
+  sed -i 's/chgrp -R plugdev/chgrp -R openrazer/' install_files/udev/razer_mount
+}
+
+package_openrazer-daemon() {
+  depends=(dbus-python openrazer-driver-dkms python-daemonize python-gobject python-pyudev python-setproctitle xautomation)
+  optdepends=('libnotify: for the battery notifier')
+
+  cd "$pkgbase"
+  make DESTDIR="$pkgdir" daemon_install
+}
+
+package_openrazer-driver-dkms() {
+  depends=(dkms)
+
+  cd "$pkgbase"
+  make DESTDIR="$pkgdir" setup_dkms udev_install
+  install -Dm644 ../sysusers.conf "$pkgdir"/usr/lib/sysusers.d/$pkgbase.conf
+}
+
+package_python-openrazer() {
+  depends=(openrazer-daemon python-numpy)
+
+  cd "$pkgbase"
+  make DESTDIR="$pkgdir" python_library_install
+}
+PKGBUILD
+```
+
+Build and install the packages:
+
+```bash
+makepkg -Cfs --noconfirm
+sudo pacman -U --noconfirm \
+  ./openrazer-driver-dkms-3.12.2-4-any.pkg.tar.zst \
+  ./openrazer-daemon-3.12.2-4-any.pkg.tar.zst \
+  ./python-openrazer-3.12.2-4-any.pkg.tar.zst
+```
+
+Add the user to the OpenRazer access group, reload udev, and rebind the kernel driver:
+
+```bash
+sudo usermod -aG openrazer "$USER"
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=usb
+sudo udevadm trigger --action=add --subsystem-match=hid
+sudo modprobe -r razerkbd razermouse razerkraken razeraccessory 2>/dev/null || true
+sudo modprobe razerkbd
+```
+
+Group membership is not visible to already-running login sessions. After logging out and back in, enable the normal user service:
+
+```bash
+systemctl --user enable --now openrazer-daemon.service
+```
+
+For the current session before logging out, start the daemon through the refreshed group with:
+
+```bash
+systemctl --user stop openrazer-daemon.service 2>/dev/null || true
+systemd-run --user --unit=openrazer-daemon-current-session --collect \
+  /usr/bin/sg openrazer -c '/usr/bin/openrazer-daemon -F'
+```
+
+Verify DKMS, kernel binding, and daemon detection:
+
+```bash
+pacman -Q openrazer-driver-dkms openrazer-daemon python-openrazer
+dkms status | grep openrazer
+find /sys/bus/hid/drivers/razerkbd -maxdepth 1 -mindepth 1 -name '0003:1532:02E0.*' -printf '%f\n'
+python - <<'PY'
+from openrazer.client import DeviceManager
+manager = DeviceManager()
+print("daemon_version=" + str(manager.daemon_version))
+print("device_count=" + str(len(manager.devices)))
+for device in manager.devices:
+    print(f"{device.name}|{device.serial}|{device.type}")
+PY
+```
+
+Expected result:
+
+```text
+daemon_version=3.12.2
+device_count=1
+Razer Blade 16 (2026)|<serial>|keyboard
+```
+
+### Polychromatic on CachyOS
+
+Polychromatic was installed from the AUR:
+
+```bash
+paru -S --needed polychromatic
+```
+
+No separate Polychromatic configuration was needed. It discovers devices through the OpenRazer DBus daemon. The CLI is deprecated upstream, but it is still useful as a quick verification step:
+
+```bash
+polychromatic-cli --list-devices --no-pretty-column
+```
+
+Expected result:
+
+```text
+Connected Devices:
+Name (-n)                 Form Factor (-d)    Serial (-s)    Zones (-z)
+Razer Blade 16 (2026)     laptop              <serial>       main, logo
+```
+
+Launch the GUI with:
+
+```bash
+polychromatic-controller
+```
+
 ---
 
 ## Device Support
